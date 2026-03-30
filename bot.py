@@ -95,4 +95,65 @@ def run_check():
             time.sleep(1) # Regulatory pause
 
 if __name__ == "__main__":
+    run_check()    # Return specific alerts based on priority
+    if displacement_up.iloc[-1]:
+        return f"🔥 **PHASE 4: BULLISH DISPLACEMENT ({tf})**\n{symbol}: Retail trapped. Expansion starting."
+    if displacement_down.iloc[-1]:
+        return f"🔥 **PHASE 4: BEARISH DISPLACEMENT ({tf})**\n{symbol}: Retail trapped. Expansion starting."
+    if is_eql:
+        return f"🧱 **PHASE 1: BUILD (EQL) ({tf})**\n{symbol}: Equal Lows forming. Liquidity is being engineered here."
+    if is_eqh:
+        return f"🧱 **PHASE 1: BUILD (EQH) ({tf})**\n{symbol}: Equal Highs forming. Liquidity is being engineered here."
+    
+    return None
+
+def send_to_discord(content, is_heartbeat=False):
+    payload = {"username": "Omni-Manipulation Bot"}
+    if is_heartbeat:
+        payload["embeds"] = [content]
+    else:
+        payload["content"] = content
+    
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json=payload)
+    except Exception as e:
+        print(f"Discord Error: {e}")
+
+def run_check():
+    # Multi-exchange pool
+    exchanges = [
+        ccxt.bybit({'enableRateLimit': True}),
+        ccxt.bitget({'enableRateLimit': True}),
+        ccxt.gateio({'enableRateLimit': True}),
+        ccxt.kraken({'enableRateLimit': True})
+    ]
+    
+    # Heartbeat
+    if datetime.utcnow().hour == HEARTBEAT_HOUR:
+        send_to_discord({
+            "title": "💓 System Heartbeat",
+            "description": f"Scanning {len(SYMBOLS)} assets across {len(TIMEFRAMES)} timeframes.",
+            "color": 3447003
+        }, is_heartbeat=True)
+
+    for symbol in SYMBOLS:
+        for tf in TIMEFRAMES:
+            for exchange in exchanges:
+                try:
+                    # Specific handling for Kraken's symbol naming
+                    clean_symbol = symbol if exchange.id != 'kraken' else symbol.replace('USDT', 'USD')
+                    
+                    bars = exchange.fetch_ohlcv(clean_symbol, timeframe=tf, limit=100)
+                    df = pd.DataFrame(bars, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+                    
+                    alert = identify_phases(df, tf, symbol)
+                    if alert:
+                        send_to_discord(f"**[Market Update]**\nSource: {exchange.id}\n{alert}")
+                    
+                    break # Success on this symbol/tf, move to next
+                except Exception:
+                    continue # Try next exchange if this one fails
+            time.sleep(1) # Regulatory pause
+
+if __name__ == "__main__":
     run_check()
