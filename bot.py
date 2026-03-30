@@ -4,115 +4,95 @@ import pandas as pd
 import requests
 import time
 from datetime import datetime
+import numpy as np
 
 # --- CONFIGURATION ---
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'XRP/USDT', 'ADA/USDT', 
            'DOGE/USDT', 'SOL/USDT', 'LINK/USDT', 'SUI/USDT', 'POL/USDT']
 TIMEFRAMES = ['1h', '4h', '1d']
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK')
-HEARTBEAT_HOUR = 12 
+
+def get_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def is_killzone():
+    """Checks if the current UTC time falls within London or NY Open"""
+    now_utc = datetime.utcnow().hour
+    # London Open (07:00-10:00 UTC) | NY Open (13:00-16:00 UTC)
+    return (7 <= now_utc <= 10) or (13 <= now_utc <= 16)
 
 def identify_phases(df, tf, symbol):
-    """
-    Analyzes the 4-Phase Manipulation Model:
-    1. Build (Equal Levels)
-    2. Induction
-    3. Raid (Stop Run)
-    4. Displacement (Trend Start)
-    """
-    if len(df) < 25: 
-        return None
-        
+    if len(df) < 30: return None
+    
+    # Technical Indicators
+    df['rsi'] = get_rsi(df['close'])
+    df['avg_vol'] = df['vol'].rolling(window=10).mean()
+    
     lookback = 20
-    # Establish the structural "Levels"
     df['lowest_prev'] = df['low'].shift(1).rolling(window=lookback).min()
     df['highest_prev'] = df['high'].shift(1).rolling(window=lookback).max()
     
-    # 1. THE BUILD DETECTOR (Sensitivity: 0.15%)
+    # 1. THE BUILD (Phase 1)
     threshold = 0.0015
-    current_low = df['low'].iloc[-1]
-    current_high = df['high'].iloc[-1]
-    last_close = df['close'].iloc[-1]
+    is_eql = abs(df['low'].iloc[-1] - df['lowest_prev'].iloc[-1]) < (df['close'].iloc[-1] * threshold)
+    is_eqh = abs(df['high'].iloc[-1] - df['highest_prev'].iloc[-1]) < (df['close'].iloc[-1] * threshold)
     
-    is_eql = abs(current_low - df['lowest_prev'].iloc[-1]) < (last_close * threshold)
-    is_eqh = abs(current_high - df['highest_prev'].iloc[-1]) < (last_close * threshold)
+    # 2 & 3. THE RAID (Phase 2/3)
+    # Check if the previous candle performed the raid
+    raided_low = (df['low'].iloc[-2] < df['lowest_prev'].iloc[-2]) and (df['close'].iloc[-2] > df['lowest_prev'].iloc[-2])
+    raided_high = (df['high'].iloc[-2] > df['highest_prev'].iloc[-2]) and (df['close'].iloc[-2] < df['highest_prev'].iloc[-2])
     
-    # 2 & 3. THE RAID (Look at the PREVIOUS candle for the sweep)
-    # Price dipped below/above and closed back inside
-    raided_lows = (df['low'] < df['lowest_prev']) & (df['close'] > df['lowest_prev'])
-    raided_highs = (df['high'] > df['highest_prev']) & (df['close'] < df['highest_prev'])
+    # 4. DISPLACEMENT (Phase 4) + UPGRADES
+    # Logic: Raid happened + Price breaks high/low + High Volume + Killzone
+    vol_confirmation = df['vol'].iloc[-1] > (df['avg_vol'].iloc[-1] * 1.3)
+    active_timing = is_killzone()
     
-    # 4. DISPLACEMENT (The current candle confirms the move)
-    displacement_up = raided_lows.shift(1) & (df['close'] > df['high'].shift(1))
-    displacement_down = raided_highs.shift(1) & (df['close'] < df['low'].shift(1))
+    # Bullish Displacement
+    if raided_low and df['close'].iloc[-1] > df['high'].iloc[-2]:
+        msg = f"🚀 **INSTITUTIONAL BUY SIGNAL ({tf})**\nAsset: {symbol}\n"
+        if vol_confirmation: msg += "✅ High Volume Commitment\n"
+        if active_timing: msg += "✅ Within Session Killzone\n"
+        if df['rsi'].iloc[-1] < 40: msg += "✅ Oversold Recovery (Divergence Risk Low)\n"
+        return msg
 
-    # Logic Priority: Displacement > Build
-    if displacement_up.iloc[-1]:
-        return f"🔥 **PHASE 4: BULLISH DISPLACEMENT ({tf})**\nAsset: {symbol}\nStatus: Retail trapped below support. Smart money is buying the raid."
-    if displacement_down.iloc[-1]:
-        return f"🔥 **PHASE 4: BEARISH DISPLACEMENT ({tf})**\nAsset: {symbol}\nStatus: Retail trapped above resistance. Smart money is selling the raid."
-    if is_eql:
-        return f"🧱 **PHASE 1: BUILD (Equal Lows) ({tf})**\nAsset: {symbol}\nStatus: Liquidity is being engineered. Expect a raid below this level soon."
-    if is_eqh:
-        return f"🧱 **PHASE 1: BUILD (Equal Highs) ({tf})**\nAsset: {symbol}\nStatus: Liquidity is being engineered. Expect a raid above this level soon."
-    
+    # Bearish Displacement
+    if raided_high and df['close'].iloc[-1] < df['low'].iloc[-2]:
+        msg = f"⚠️ **INSTITUTIONAL SELL SIGNAL ({tf})**\nAsset: {symbol}\n"
+        if vol_confirmation: msg += "✅ High Volume Commitment\n"
+        if active_timing: msg += "✅ Within Session Killzone\n"
+        if df['rsi'].iloc[-1] > 60: msg += "✅ Overbought Recovery\n"
+        return msg
+
+    # Build Warning
+    if is_eql or is_eqh:
+        level_type = "Support (EQL)" if is_eql else "Resistance (EQH)"
+        return f"🧱 **BUILD DETECTED ({tf})**\nAsset: {symbol}\nLevel: Engineered {level_type}.\n*Action: Stand by for the Raid.*"
+
     return None
 
-def send_to_discord(content, is_heartbeat=False):
-    payload = {"username": "Omni-Manipulation Bot"}
-    if is_heartbeat:
-        payload["embeds"] = [content]
-    else:
-        payload["content"] = content
-    
-    try:
-        response = requests.post(DISCORD_WEBHOOK_URL, json=payload)
-        response.raise_for_status()
-    except Exception as e:
-        print(f"Discord Error: {e}")
-
 def run_check():
-    # Multi-exchange rotation to handle regional blocks
-    exchanges = [
-        ccxt.bybit({'enableRateLimit': True}),
-        ccxt.bitget({'enableRateLimit': True}),
-        ccxt.gateio({'enableRateLimit': True}),
-        ccxt.kraken({'enableRateLimit': True})
-    ]
+    exchanges = [ccxt.bybit(), ccxt.bitget(), ccxt.kraken()]
     
-    # Send Heartbeat at scheduled hour
-    if datetime.utcnow().hour == HEARTBEAT_HOUR:
-        send_to_discord({
-            "title": "💓 System Heartbeat",
-            "description": f"Successfully scanning {len(SYMBOLS)} assets.",
-            "color": 3447003,
-            "fields": [{"name": "Mode", "value": "Institutional Process Tracking", "inline": True}]
-        }, is_heartbeat=True)
-
     for symbol in SYMBOLS:
-        print(f"--- Scanning {symbol} ---")
         for tf in TIMEFRAMES:
-            success = False
             for exchange in exchanges:
                 try:
-                    # Sync symbol for Kraken
                     target_symbol = symbol if exchange.id != 'kraken' else symbol.replace('USDT', 'USD')
-                    
                     bars = exchange.fetch_ohlcv(target_symbol, timeframe=tf, limit=100)
                     df = pd.DataFrame(bars, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
                     
                     alert = identify_phases(df, tf, symbol)
                     if alert:
-                        send_to_discord(f"**[Market Update]**\n{alert}")
-                    
-                    success = True
-                    break # Success, move to next timeframe
-                except Exception as e:
-                    print(f"Exchange {exchange.id} failed for {symbol}: {e}")
+                        payload = {"username": "OMNI-PRO", "content": alert}
+                        requests.post(DISCORD_WEBHOOK_URL, json=payload)
+                    break 
+                except:
                     continue
-            
-            # Anti-Rate Limit: 1.5 second pause between timeframes
-            time.sleep(1.5)
+            time.sleep(1)
 
 if __name__ == "__main__":
     run_check()
